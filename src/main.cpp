@@ -2,11 +2,10 @@
 #include <zephyr/logging/log.h>
 #include <string.h>
 
-// 引入 Zephyr Video & Display API
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/video.h>
-#include <zephyr/drivers/display.h> // ✅ 新增 Display 標頭檔
-
+#include <zephyr/drivers/display.h> 
 extern "C" {
     #include "network.h"
     #include "network_data.h"
@@ -30,8 +29,8 @@ static postprocess_outBuffer_t detections[MAX_DETECTIONS];
 // ==========================================
 // Video & LCD Buffer 配置
 // ==========================================
-#define MAX_FRAME_SIZE  (320 * 240 * 2) // QVGA RGB565 最大尺寸
-#define BUFFER_COUNT    4               // 4 個緩衝區輪替
+#define MAX_FRAME_SIZE  (320 * 240 * 2) 
+#define BUFFER_COUNT    4               
 
 // 強制將相機緩衝區放在 SDRAM2
 static uint8_t raw_video_data[BUFFER_COUNT][MAX_FRAME_SIZE] __attribute__((section("SDRAM2")));
@@ -64,7 +63,6 @@ static uint8_t* out_buffers[3] = { my_output_0, my_output_1, my_output_2 };
 // 繪圖與設備初始化
 // ==========================================
 
-// ✅ 新增：在 RGB565 影像上畫框的函數
 static void draw_box_rgb565(uint8_t *img_buf, uint32_t img_w, uint32_t img_h, 
                             int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
@@ -93,7 +91,7 @@ static void draw_box_rgb565(uint8_t *img_buf, uint32_t img_w, uint32_t img_h,
     }
 }
 
-// ✅ 新增：初始化 LCD 顯示器
+
 static int setup_display(void) {
     display_dev = DEVICE_DT_GET_OR_NULL(DT_CHOSEN(zephyr_display));
     if (!device_is_ready(display_dev)) {
@@ -232,10 +230,10 @@ int main(void) {
 
         if (process_camera_frame(vbuf->buffer, cam_fmt.width, cam_fmt.height) == 0) {
             
-            // ✅ 提早歸還相機緩衝區
+            
             video_enqueue(video_dev, vbuf);
             
-            // 執行 AI 推論
+            
             stai_return_code err = stai_network_run(network, (stai_run_mode)0);
             
             if (err == 0) {
@@ -248,19 +246,18 @@ int main(void) {
                 if (App_Config.output.nb_detect > 0) {
                     LOG_INF("[Result] Frame %d -> Found %d objects!", frame_count, (int)App_Config.output.nb_detect);
                     
-                    // ✅ 畫出綠色邊框 (0x07E0)
+                    
                     for (int i = 0; i < App_Config.output.nb_detect; i++) {
                         float w = App_Config.output.pOutBuff[i].width;
                         float h = App_Config.output.pOutBuff[i].height;
                         float cx = App_Config.output.pOutBuff[i].x_center;
                         float cy = App_Config.output.pOutBuff[i].y_center;
                         
-                        // 將中心座標轉換為左上角座標
+                        
                         int16_t bx = (int16_t)(cx - w / 2.0f);
                         int16_t by = (int16_t)(cy - h / 2.0f);
 
-                        // 注意：如果模型輸出的座標是 0.0~1.0 的比例值，你需要先乘上 192.0f
-                        // 範例: bx = (int16_t)((cx - w / 2.0f) * 192.0f);
+                        
                         
                         draw_box_rgb565(lcd_buffer, 192, 192, bx, by, (uint16_t)w, (uint16_t)h, 0x07E0);
                     }
@@ -268,7 +265,7 @@ int main(void) {
                     LOG_INF("[Result] Frame %d -> No objects.", frame_count);
                 }
 
-                // ✅ 推送畫面到 LCD 螢幕
+                
                 if (device_is_ready(display_dev)) {
                     struct display_buffer_descriptor buf_desc = {
                         .buf_size = sizeof(lcd_buffer),
