@@ -4,7 +4,8 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/video.h>
 #include <stm32h7xx_hal.h>
-#include <zephyr/drivers/display.h> 
+#include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/gpio.h>
 
 extern "C" {
     #include "network.h"
@@ -15,28 +16,51 @@ extern "C" {
 }
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-// ========================================
-// 系統設備與全域變數
-// ========================================
+#pragma pack(push, 1)
+struct spi_header {
+    uint16_t magic_word;
+    uint32_t image_size;
+    uint16_t box_count;
+};
+
+struct bbox_data {
+    uint16_t x;
+    uint16_t y;
+    uint16_t w;
+    uint16_t h;
+    float    conf;
+    uint8_t  label_char;
+};
+#pragma pack(pop)
+
+static const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi5));
+static struct spi_config spi_cfg;
+
+// 🚨 修正：將 CS 當作獨立的 GPIO 控制，不要依賴 DeviceTree 裡的 cs-gpios
+static const struct gpio_dt_spec manual_cs = {
+    .port = DEVICE_DT_GET(DT_NODELABEL(gpiok)),
+    .pin = 1,
+    .dt_flags = GPIO_ACTIVE_HIGH  // 設定為 Active High，這樣 set(0) 就是 0V，set(1) 就是 3.3V
+};
+
 static const struct device *video_dev;
-static const struct device *display_dev; 
 static AppConfig_TypeDef App_Config;
 
 #define MAX_DETECTIONS 10 
 static postprocess_outBuffer_t detections[MAX_DETECTIONS];
 
-// ==========================================
-// 🚨 雙重緩衝區 (Ping-Pong Buffer) 配置
-// ==========================================
 #define MAX_FRAME_SIZE  (320 * 240 * 2) 
 #define BUFFER_COUNT    2              
 
+// 🚀 DMA 專用無快取跳板緩衝區 (Bounce Buffer)
+#define SPI_CHUNK_SIZE 32000
+static uint8_t spi_bounce_buffer[SPI_CHUNK_SIZE] __attribute__((section(".nocache")));
+
+static uint8_t spi_img_buffer[2][192 * 192 * 2] __attribute__((section("SDRAM2")));
 static uint8_t raw_video_data[BUFFER_COUNT][MAX_FRAME_SIZE] __attribute__((section("SDRAM2")));
 static struct video_buffer video_buf_metadata[BUFFER_COUNT];
 static struct video_format cam_fmt;
 
-// ✅ 宣告「兩組」陣列輪流使用，防止 Thread 1 寫入時覆蓋到 Thread 2 正在用的資料
-static uint8_t lcd_buffer[2][192 * 192 * 2] __attribute__((section("SDRAM2")));
 static uint8_t my_camera_data[2][STAI_NETWORK_IN_1_SIZE_BYTES] __attribute__((aligned(32), section("SDRAM2"))); 
 static uint8_t network_context[STAI_NETWORK_CONTEXT_SIZE] __attribute__((aligned(32), section("SDRAM2")));
 static stai_network* network = (stai_network*)network_context;
@@ -46,52 +70,19 @@ static uint8_t my_output_2[STAI_NETWORK_OUT_3_SIZE_BYTES] __attribute__((aligned
 
 static uint8_t my_activations[STAI_NETWORK_ACTIVATIONS_SIZE_BYTES] __attribute__((aligned(32)));
 
-static uint8_t* in_buffers[1]; // 將在執行緒中動態切換
+static uint8_t* in_buffers[1]; 
 static uint8_t* act_buffers[1] = { my_activations };
 static uint8_t* out_buffers[3] = { my_output_0, my_output_1, my_output_2 };
 
-// ==========================================
-// 🚨 訊息佇列與執行緒定義 (IPC)
-// ==========================================
-// 這個結構用來在兩個執行緒之間傳遞「哪一組 Buffer 準備好了」
 struct frame_msg {
     int buf_idx;
-    uint32_t prep_time; // 順便把前處理的測速時間傳遞給主執行緒印出
+    uint32_t prep_time; 
 };
 K_MSGQ_DEFINE(frame_msgq, sizeof(struct frame_msg), 2, 4);
 
-// 定義相機執行緒的記憶體與資料結構
 #define CAM_THREAD_STACK_SIZE 4096
 K_THREAD_STACK_DEFINE(cam_thread_stack, CAM_THREAD_STACK_SIZE);
 struct k_thread cam_thread_data;
-
-// ==========================================
-// 繪圖與設備初始化
-// ==========================================
-static void draw_box_rgb565(uint8_t *img_buf, uint32_t img_w, uint32_t img_h, 
-                            int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t color) {
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x >= img_w || y >= img_h) return;
-    if (x + w > img_w) w = img_w - x;
-    if (y + h > img_h) h = img_h - y;
-
-    uint8_t color_h = (color >> 8) & 0xFF;
-    uint8_t color_l = color & 0xFF;
-
-    for (uint16_t i = 0; i < w; i++) {
-        size_t top_idx = ((y * img_w) + (x + i)) * 2;
-        size_t bot_idx = (((y + h - 1) * img_w) + (x + i)) * 2;
-        img_buf[top_idx] = color_h; img_buf[top_idx + 1] = color_l;
-        img_buf[bot_idx] = color_h; img_buf[bot_idx + 1] = color_l;
-    }
-    for (uint16_t j = 0; j < h; j++) {
-        size_t left_idx = (((y + j) * img_w) + x) * 2;
-        size_t right_idx = (((y + j) * img_w) + (x + w - 1)) * 2;
-        img_buf[left_idx] = color_h; img_buf[left_idx + 1] = color_l;
-        img_buf[right_idx] = color_h; img_buf[right_idx + 1] = color_l;
-    }
-}
 
 static void Enable_SDRAM_Cache(void) {
     MPU_Region_InitTypeDef MPU_InitStruct = {0};
@@ -113,19 +104,10 @@ static void Enable_SDRAM_Cache(void) {
     SCB_EnableDCache();
 }
 
-static int setup_display(void) {
-    display_dev = DEVICE_DT_GET_OR_NULL(DT_CHOSEN(zephyr_display));
-    if (!device_is_ready(display_dev)) return -ENODEV;
-    display_set_pixel_format(display_dev, PIXEL_FORMAT_RGB_565);
-    display_blanking_off(display_dev);
-    return 0;
-}
-
 int ai_init(void) {
     if (stai_network_init(network) != 0) return -1;
     if (stai_network_set_activations(network, act_buffers, 1) != 0) return -1;
     if (stai_network_set_outputs(network, out_buffers, 3) != 0) return -1;
-    // 注意：Input 現在改由迴圈內動態設定
     return 0;
 }
 
@@ -154,7 +136,6 @@ static int setup_camera(void) {
 
 #pragma GCC push_options
 #pragma GCC optimize ("O3", "unroll-loops")
-// ✅ 新增 buf_idx 參數，決定要把結果寫到哪一個 Buffer
 static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint32_t src_h, int buf_idx) {
     if (src_w < 192 || src_h < 192) return -1;
 
@@ -162,7 +143,7 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
     uint32_t crop_y = (src_h - 192) / 2;
 
     uint8_t *ai_ptr = my_camera_data[buf_idx]; 
-    uint16_t *lcd_ptr_16 = (uint16_t *)lcd_buffer[buf_idx]; 
+    uint16_t *spi_ptr_16 = (uint16_t *)spi_img_buffer[buf_idx]; 
 
     for (uint32_t y = 0; y < 192; y++) {
         uint32_t src_y = y + crop_y;
@@ -170,6 +151,7 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
 
         for (uint32_t x = 0; x < 192; x++) {
             uint16_t pixel = *row_ptr_16++;
+            
             uint8_t r = (pixel >> 11) & 0x1F;
             uint8_t g = (pixel >> 5)  & 0x3F;
             uint8_t b =  pixel        & 0x1F;
@@ -177,19 +159,16 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
             *ai_ptr++ = (r << 3) | (r >> 2); 
             *ai_ptr++ = (g << 2) | (g >> 4); 
             *ai_ptr++ = (b << 3) | (b >> 2); 
-
-            *lcd_ptr_16++ = pixel;
+            
+            *spi_ptr_16++ = pixel;
         }
     }
     return 0;
 }
 #pragma GCC pop_options
 
-// ==========================================
-// 📸 Thread 1: Camera 處理執行緒
-// ==========================================
 void camera_thread_entry(void *p1, void *p2, void *p3) {
-    int current_buf_idx = 0; // 從 0 號緩衝區開始
+    int current_buf_idx = 0; 
 
     while (1) {
         struct video_buffer *vbuf;
@@ -197,33 +176,41 @@ void camera_thread_entry(void *p1, void *p2, void *p3) {
 
         uint32_t t_start = k_uptime_get_32();
         
-        // 影像處理：寫入指定的 current_buf_idx
         if (process_camera_frame(vbuf->buffer, cam_fmt.width, cam_fmt.height, current_buf_idx) == 0) {
             uint32_t t_prep = k_uptime_get_32() - t_start;
-
-            // 打包訊息
             struct frame_msg msg = { .buf_idx = current_buf_idx, .prep_time = t_prep };
             
-            // 寄送訊息給 AI 執行緒。如果 AI 算太慢導致佇列塞車，就清空舊的 (Drop Frame機制)
             while (k_msgq_put(&frame_msgq, &msg, K_NO_WAIT) != 0) {
                 k_msgq_purge(&frame_msgq);
             }
-
-            // 切換 Ping-Pong Buffer (0變1，1變0)
             current_buf_idx = (current_buf_idx + 1) % 2;
         }
-        
         video_enqueue(video_dev, vbuf);
     }
 }
 
-// ==========================================
-// 🧠 Thread 2: 主程式 (AI 推論與顯示)
-// ==========================================
 int main(void) {
     Enable_SDRAM_Cache();
     k_msleep(1000);
-    LOG_INF("Starting STEdgeAI + Zephyr Multi-Thread Camera...");
+    LOG_INF("Starting STEdgeAI + Zephyr Multi-Thread (SPI Output Mode)...");
+
+    if (!device_is_ready(spi_dev)) {
+        LOG_ERR("SPI not ready!");
+        return 0;
+    }
+
+    // 🚨 修正：手動初始化 CS 腳位 (假設是 PK1)，並預設拉高 (Inactive)
+    if (gpio_is_ready_dt(&manual_cs)) {
+        gpio_pin_configure_dt(&manual_cs, GPIO_OUTPUT_INACTIVE);
+        gpio_pin_set_dt(&manual_cs, 1); // 實體電壓 3.3V
+    } else {
+        LOG_ERR("CS GPIO not ready!");
+    }
+
+    // 🚨 修正：取消 Zephyr 對 CS 的控制 (.cs = NULL)
+  
+    spi_cfg.frequency = 4000000U; // 確保與 L4 完全一致的 15MHz
+    spi_cfg.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_LINES_SINGLE | SPI_TRANSFER_MSB;
 
     if (ai_init() != 0) return 0;
     App_Config.output.pOutBuff = detections;
@@ -234,30 +221,23 @@ int main(void) {
     if (!video_dev) video_dev = DEVICE_DT_GET(DT_NODELABEL(ov5640)); 
     if (!device_is_ready(video_dev) || setup_camera() < 0) return 0;
 
-    setup_display();
-
     if (video_stream_start(video_dev, VIDEO_BUF_TYPE_OUTPUT) < 0) return 0;
 
-    // 🚀 啟動 Camera 獨立執行緒 (設定優先權為 5)
     k_thread_create(&cam_thread_data, cam_thread_stack,
                     K_THREAD_STACK_SIZEOF(cam_thread_stack),
                     camera_thread_entry,
                     NULL, NULL, NULL,
                     5, 0, K_NO_WAIT);
 
-    LOG_INF("System Ready. Pipelined Inference Started.");
+    LOG_INF("System Ready. Pipelined Inference & SPI TX Started.");
     uint32_t frame_count = 0;
 
     while (1) {
         struct frame_msg msg;
-        
-        // 等待 Camera Thread 寄信來 (這會讓出 CPU，不浪費資源)
         k_msgq_get(&frame_msgq, &msg, K_FOREVER);
         frame_count++;
 
         int buf_idx = msg.buf_idx;
-
-        // 🚨 動態切換 AI 模型輸入指標到準備好的那個 Buffer
         in_buffers[0] = my_camera_data[buf_idx];
         stai_network_set_inputs(network, in_buffers, 1);
 
@@ -265,14 +245,17 @@ int main(void) {
         stai_return_code err = stai_network_run(network, (stai_run_mode)0);
         uint32_t t_ai = k_uptime_get_32() - t_start;
 
-        LOG_INF("⏱️ Frame %d Time -> Image Prep: %u ms | AI Inference: %u ms", 
-                frame_count, msg.prep_time, t_ai);
-
         if (err == 0) {
             app_postprocess_run((void**)out_buffers, &App_Config.output, &App_Config.input_static_param);
 
+            struct spi_header hdr;
+            hdr.magic_word = 0xAABB;
+            hdr.image_size = 192 * 192 * 2; 
+
+            struct bbox_data bboxes[10];
+            uint16_t valid_boxes = 0;
+
             if (App_Config.output.nb_detect > 0) {
-                int valid_boxes = 0; 
                 for (int i = 0; i < App_Config.output.nb_detect; i++) {
                     float w = App_Config.output.pOutBuff[i].width;
                     float h = App_Config.output.pOutBuff[i].height;
@@ -282,28 +265,68 @@ int main(void) {
                     int class_idx = App_Config.output.pOutBuff[i].class_index;
 
                     if (class_idx == 0 || conf < 0.60f) continue;
-                    valid_boxes++;
 
-                    if (w <= 1.0f && h <= 1.0f) {
-                        cx *= 192.0f; cy *= 192.0f; w *= 192.0f; h *= 192.0f;
-                    }
-
+                    if (w <= 1.0f && h <= 1.0f) { cx *= 192.0f; cy *= 192.0f; w *= 192.0f; h *= 192.0f; }
                     int16_t bx = (int16_t)(cx - w / 2.0f);
                     int16_t by = (int16_t)(cy - h / 2.0f);
                     
-                    // 🚨 畫在準備好的那張 LCD Buffer 上
-                    draw_box_rgb565(lcd_buffer[buf_idx], 192, 192, bx, by, (uint16_t)w, (uint16_t)h, 0x07E0);
+                    if (valid_boxes < 10) {
+                        bboxes[valid_boxes].x = (uint16_t)(bx > 0 ? bx : 0);
+                        bboxes[valid_boxes].y = (uint16_t)(by > 0 ? by : 0);
+                        bboxes[valid_boxes].w = (uint16_t)w;
+                        bboxes[valid_boxes].h = (uint16_t)h;
+                        bboxes[valid_boxes].conf = conf;
+                        bboxes[valid_boxes].label_char = (class_idx == 1) ? 'C' : '?';
+                        valid_boxes++;
+                    }
                 }
-                if (valid_boxes > 0) LOG_INF("[Result] Frame %d -> Successfully drawn %d Cones!", frame_count, valid_boxes);
             }
 
-            if (device_is_ready(display_dev)) {
-                struct display_buffer_descriptor buf_desc = {
-                    .buf_size = sizeof(lcd_buffer[0]), .width = 192, .height = 192, .pitch = 192
-                };
-                // 🚨 將正確的 Buffer 推送到螢幕
-                display_write(display_dev, 0, 0, &buf_desc, lcd_buffer[buf_idx]);
+            hdr.box_count = valid_boxes;
+
+            // ==========================================
+            // 📡 執行 SPI 分批傳輸 (手動 CS + 跳板策略)
+            // ==========================================
+            uint32_t t_spi_start = k_uptime_get_32();
+
+
+
+            // 1. 手動拉低 CS 腳位
+            gpio_pin_set_dt(&manual_cs, 0); 
+            k_msleep(5); // 給 L4 充足的時間醒來準備
+
+            // --- 階段 A：傳送固定 138 Bytes 的標頭區塊 ---
+            #define HEADER_BLOCK_SIZE (sizeof(struct spi_header) + 10 * sizeof(struct bbox_data))
+            uint8_t header_block[HEADER_BLOCK_SIZE] = {0}; // 建立在 Stack 的安全陣列
+            
+            memcpy(header_block, &hdr, sizeof(hdr));
+            if (valid_boxes > 0) {
+                memcpy(header_block + sizeof(hdr), bboxes, valid_boxes * sizeof(struct bbox_data));
             }
+
+            struct spi_buf tx_hdr_buf = { .buf = header_block, .len = HEADER_BLOCK_SIZE };
+            struct spi_buf_set tx_hdr_set = { .buffers = &tx_hdr_buf, .count = 1 };
+            spi_write(spi_dev, &spi_cfg, &tx_hdr_set);
+
+            k_usleep(1000); // 稍微等待 L4 消化標頭
+
+            // --- 階段 B：直接傳送 73KB 影像 (讓 Zephyr 驅動自己慢慢送) ---
+            struct spi_buf tx_img_buf = { .buf = spi_img_buffer[buf_idx], .len = hdr.image_size };
+            struct spi_buf_set tx_img_set = { .buffers = &tx_img_buf, .count = 1 };
+            spi_write(spi_dev, &spi_cfg, &tx_img_set);
+
+            k_usleep(500);
+
+            // 傳輸結束，手動拉高 CS 腳位
+            gpio_pin_set_dt(&manual_cs, 1); 
+
+            uint32_t t_spi = k_uptime_get_32() - t_spi_start;
+
+            LOG_INF("⏱️ Frame %d -> Prep: %u ms | AI: %u ms | SPI: %u ms | Boxes: %u", 
+                    frame_count, msg.prep_time, t_ai, t_spi, valid_boxes);
+                    
+        } else {
+            LOG_WRN("[Error] AI inference failed! Code: 0x%08X", (unsigned int)err);
         }
     }
     return 0;
