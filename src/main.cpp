@@ -7,6 +7,13 @@
 #include <zephyr/drivers/spi.h>
 #include <zephyr/drivers/gpio.h>
 
+// ==========================================
+// 🗜️ 新增：引入 JPEG 壓縮庫與記憶體寫入器
+// ==========================================
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+
 extern "C" {
     #include "network.h"
     #include "network_data.h"
@@ -55,6 +62,11 @@ static postprocess_outBuffer_t detections[MAX_DETECTIONS];
 // 🚀 DMA 專用無快取跳板緩衝區 (Bounce Buffer)
 #define SPI_CHUNK_SIZE 32000
 static uint8_t spi_bounce_buffer[SPI_CHUNK_SIZE] __attribute__((section(".nocache")));
+
+// 宣告用來放 JPEG 資料的陣列 (放在 SDRAM2 空間很夠)
+static uint8_t compressed_jpeg_buffer[30000] __attribute__((section("SDRAM2")));
+static uint32_t jpeg_current_size = 0;
+
 
 static uint8_t spi_img_buffer[2][192 * 192 * 2] __attribute__((section("SDRAM2")));
 static uint8_t raw_video_data[BUFFER_COUNT][MAX_FRAME_SIZE] __attribute__((section("SDRAM2")));
@@ -134,6 +146,14 @@ static int setup_camera(void) {
     return 0;
 }
 
+void my_jpeg_write_func(void *context, void *data, int size) {
+    if (jpeg_current_size + size <= sizeof(compressed_jpeg_buffer)) {
+        memcpy(compressed_jpeg_buffer + jpeg_current_size, data, size);
+        jpeg_current_size += size;
+    }
+}
+
+
 #pragma GCC push_options
 #pragma GCC optimize ("O3", "unroll-loops")
 static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint32_t src_h, int buf_idx) {
@@ -209,7 +229,7 @@ int main(void) {
 
     // 🚨 修正：取消 Zephyr 對 CS 的控制 (.cs = NULL)
   
-    spi_cfg.frequency = 4000000U; // 確保與 L4 完全一致的 15MHz
+    spi_cfg.frequency = 1500000U; // 確保與 L4 完全一致的 15MHz
     spi_cfg.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_LINES_SINGLE | SPI_TRANSFER_MSB;
 
     if (ai_init() != 0) return 0;
@@ -282,14 +302,27 @@ int main(void) {
                 }
             }
 
-            hdr.box_count = valid_boxes;
+hdr.box_count = valid_boxes;
 
             // ==========================================
-            // 📡 執行 SPI 分批傳輸 (手動 CS + 跳板策略)
+            // 🗜️ 新增：直接拿 AI 用的 RGB888 壓成 JPEG！
+            // ==========================================
+            uint32_t t_compress_start = k_uptime_get_32();
+            jpeg_current_size = 0; // 每次壓縮前重置大小
+            
+            // 👉 神來一筆：直接餵入你的 my_camera_data[buf_idx]
+            stbi_write_jpg_to_func(my_jpeg_write_func, NULL, 192, 192, 3, my_camera_data[buf_idx], 80);
+            
+            uint32_t t_compress = k_uptime_get_32() - t_compress_start;
+            LOG_INF("🗜️ 壓縮完成！-> %u Bytes (耗時: %u ms)", jpeg_current_size, t_compress);
+
+            // 🚨 將標頭的 size 改成壓縮後的大小，L4 就會自動配合！
+            hdr.image_size = jpeg_current_size;
+
+            // ==========================================
+            // 📡 執行極速 SPI 分批傳輸
             // ==========================================
             uint32_t t_spi_start = k_uptime_get_32();
-
-
 
             // 1. 手動拉低 CS 腳位
             gpio_pin_set_dt(&manual_cs, 0); 
@@ -297,7 +330,7 @@ int main(void) {
 
             // --- 階段 A：傳送固定 138 Bytes 的標頭區塊 ---
             #define HEADER_BLOCK_SIZE (sizeof(struct spi_header) + 10 * sizeof(struct bbox_data))
-            uint8_t header_block[HEADER_BLOCK_SIZE] = {0}; // 建立在 Stack 的安全陣列
+            uint8_t header_block[HEADER_BLOCK_SIZE] = {0}; 
             
             memcpy(header_block, &hdr, sizeof(hdr));
             if (valid_boxes > 0) {
@@ -310,8 +343,9 @@ int main(void) {
 
             k_usleep(1000); // 稍微等待 L4 消化標頭
 
-            // --- 階段 B：直接傳送 73KB 影像 (讓 Zephyr 驅動自己慢慢送) ---
-            struct spi_buf tx_img_buf = { .buf = spi_img_buffer[buf_idx], .len = hdr.image_size };
+            // --- 階段 B：直接傳送壓縮後的 JPEG 影像 ---
+            // 🚨 這裡改傳 compressed_jpeg_buffer
+            struct spi_buf tx_img_buf = { .buf = compressed_jpeg_buffer, .len = hdr.image_size };
             struct spi_buf_set tx_img_set = { .buffers = &tx_img_buf, .count = 1 };
             spi_write(spi_dev, &spi_cfg, &tx_img_set);
 
@@ -322,9 +356,12 @@ int main(void) {
 
             uint32_t t_spi = k_uptime_get_32() - t_spi_start;
 
-            LOG_INF("⏱️ Frame %d -> Prep: %u ms | AI: %u ms | SPI: %u ms | Boxes: %u", 
-                    frame_count, msg.prep_time, t_ai, t_spi, valid_boxes);
-                    
+            LOG_INF("⏱️ Frame %d -> AI: %u ms | Compress: %u ms | SPI: %u ms | Boxes: %u", 
+                    frame_count, t_ai, t_compress, t_spi, valid_boxes);
+            
+            // 🚀 因為現在檔案超小，L4 的 Wi-Fi 不用 0.1 秒就傳完了
+            // 所以 H7 只要稍微休息 100ms 就可以立刻準備抓下一張畫面！
+            k_msleep(100);
         } else {
             LOG_WRN("[Error] AI inference failed! Code: 0x%08X", (unsigned int)err);
         }
