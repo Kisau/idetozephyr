@@ -4,30 +4,31 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/video.h>
 #include <stm32h7xx_hal.h>
-#include <zephyr/drivers/spi.h>
-#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/uart.h>
 
 // ==========================================
-// 🗜️ 新增：引入 JPEG 壓縮庫與記憶體寫入器
+// 🗜️ 引入 JPEG 壓縮庫與記憶體寫入器（僅對此區塊套用 O3 最佳化）
 // ==========================================
+#pragma GCC push_options
+#pragma GCC optimize ("O3", "unroll-loops", "tree-vectorize")
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-
+#pragma GCC pop_options
 
 extern "C" {
     #include "network.h"
     #include "network_data.h"
     #include "main.h" 
     #include "app_postprocess.h" 
-} 
+}
 }
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #pragma pack(push, 1)
-struct spi_header {
+struct frame_header {
     uint16_t magic_word;
-    uint32_t image_size;
-    uint16_t box_count;
+    uint32_t image_size;   // JPEG payload 的 byte 數（不含 header/boxes）
+    uint16_t box_count;    // 緊接在 header 後面的 bbox_data 筆數（0~10，非固定 10 筆）
 };
 
 struct bbox_data {
@@ -40,15 +41,8 @@ struct bbox_data {
 };
 #pragma pack(pop)
 
-static const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi5));
-static struct spi_config spi_cfg;
-
-// 🚨 修正：將 CS 當作獨立的 GPIO 控制，不要依賴 DeviceTree 裡的 cs-gpios
-static const struct gpio_dt_spec manual_cs = {
-    .port = DEVICE_DT_GET(DT_NODELABEL(gpiok)),
-    .pin = 1,
-    .dt_flags = GPIO_ACTIVE_HIGH  // 設定為 Active High，這樣 set(0) 就是 0V，set(1) 就是 3.3V
-};
+static const struct device *uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart8));
+#define UART_BAUDRATE 460800U
 
 static const struct device *video_dev;
 static AppConfig_TypeDef App_Config;
@@ -57,23 +51,26 @@ static AppConfig_TypeDef App_Config;
 static postprocess_outBuffer_t detections[MAX_DETECTIONS];
 
 #define MAX_FRAME_SIZE  (320 * 240 * 2) 
-#define BUFFER_COUNT    2              
+#define BUFFER_COUNT    2               
+#define PROC_BUF_COUNT  2               // AI/JPEG 處理管線緩衝區數量（my_camera_data 用）
 
-// 🚀 DMA 專用無快取跳板緩衝區 (Bounce Buffer)
-#define SPI_CHUNK_SIZE 32000
-static uint8_t spi_bounce_buffer[SPI_CHUNK_SIZE] __attribute__((section(".nocache")));
+// ==========================================
+// 🚀 UART 傳輸與影像緩衝區（對齊 32-byte Cache Line）
+// ==========================================
+#define UART_TX_BUF_CAP 20480
+static uint8_t uart_tx_buffer[UART_TX_BUF_CAP] __attribute__((aligned(32), section("SDRAM2")));
+#define HEADER_MAX_BLOCK_SIZE (sizeof(struct frame_header) + 10 * sizeof(struct bbox_data))
+#define MAX_JPEG_SIZE (UART_TX_BUF_CAP - HEADER_MAX_BLOCK_SIZE)
 
-// 宣告用來放 JPEG 資料的陣列 (放在 SDRAM2 空間很夠)
-static uint8_t compressed_jpeg_buffer[30000] __attribute__((section("SDRAM2")));
+static uint8_t compressed_jpeg_buffer[30000] __attribute__((aligned(32), section("SDRAM2")));
 static uint32_t jpeg_current_size = 0;
+static bool jpeg_overflow = false;
 
-
-static uint8_t spi_img_buffer[2][192 * 192 * 2] __attribute__((section("SDRAM2")));
-static uint8_t raw_video_data[BUFFER_COUNT][MAX_FRAME_SIZE] __attribute__((section("SDRAM2")));
+static uint8_t raw_video_data[BUFFER_COUNT][MAX_FRAME_SIZE] __attribute__((aligned(32), section("SDRAM2")));
 static struct video_buffer video_buf_metadata[BUFFER_COUNT];
 static struct video_format cam_fmt;
 
-static uint8_t my_camera_data[2][STAI_NETWORK_IN_1_SIZE_BYTES] __attribute__((aligned(32), section("SDRAM2"))); 
+static uint8_t my_camera_data[PROC_BUF_COUNT][STAI_NETWORK_IN_1_SIZE_BYTES] __attribute__((aligned(32), section("SDRAM2"))); 
 static uint8_t network_context[STAI_NETWORK_CONTEXT_SIZE] __attribute__((aligned(32), section("SDRAM2")));
 static stai_network* network = (stai_network*)network_context;
 static uint8_t my_output_0[STAI_NETWORK_OUT_1_SIZE_BYTES] __attribute__((aligned(32), section("SDRAM2"))); 
@@ -92,9 +89,44 @@ struct frame_msg {
 };
 K_MSGQ_DEFINE(frame_msgq, sizeof(struct frame_msg), 2, 4);
 
+static struct k_sem buf_free_sem[PROC_BUF_COUNT];
+
 #define CAM_THREAD_STACK_SIZE 4096
 K_THREAD_STACK_DEFINE(cam_thread_stack, CAM_THREAD_STACK_SIZE);
 struct k_thread cam_thread_data;
+
+// ==========================================
+// 📡 中斷驅動 UART 傳送
+// ==========================================
+static const uint8_t *uart_tx_ptr;
+static volatile size_t uart_tx_remaining;
+static struct k_sem uart_tx_done_sem;
+
+static void uart_isr(const struct device *dev, void *user_data) {
+    ARG_UNUSED(user_data);
+    if (!uart_irq_update(dev)) return;
+
+    if (uart_irq_tx_ready(dev)) {
+        if (uart_tx_remaining > 0) {
+            int n = uart_fifo_fill(dev, uart_tx_ptr, uart_tx_remaining);
+            if (n > 0) {
+                uart_tx_ptr += n;
+                uart_tx_remaining -= n;
+            }
+        }
+        if (uart_tx_remaining == 0) {
+            uart_irq_tx_disable(dev);
+            k_sem_give(&uart_tx_done_sem);
+        }
+    }
+}
+
+static void uart_send_blocking(const uint8_t *data, size_t len) {
+    uart_tx_ptr = data;
+    uart_tx_remaining = len;
+    uart_irq_tx_enable(uart_dev);
+    k_sem_take(&uart_tx_done_sem, K_FOREVER);
+}
 
 static void Enable_SDRAM_Cache(void) {
     MPU_Region_InitTypeDef MPU_InitStruct = {0};
@@ -147,12 +179,14 @@ static int setup_camera(void) {
 }
 
 void my_jpeg_write_func(void *context, void *data, int size) {
-    if (jpeg_current_size + size <= sizeof(compressed_jpeg_buffer)) {
+    ARG_UNUSED(context);
+    if (jpeg_current_size + (uint32_t)size <= sizeof(compressed_jpeg_buffer)) {
         memcpy(compressed_jpeg_buffer + jpeg_current_size, data, size);
-        jpeg_current_size += size;
+        jpeg_current_size += (uint32_t)size;
+    } else {
+        jpeg_overflow = true;
     }
 }
-
 
 #pragma GCC push_options
 #pragma GCC optimize ("O3", "unroll-loops")
@@ -163,7 +197,6 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
     uint32_t crop_y = (src_h - 192) / 2;
 
     uint8_t *ai_ptr = my_camera_data[buf_idx]; 
-    uint16_t *spi_ptr_16 = (uint16_t *)spi_img_buffer[buf_idx]; 
 
     for (uint32_t y = 0; y < 192; y++) {
         uint32_t src_y = y + crop_y;
@@ -179,8 +212,6 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
             *ai_ptr++ = (r << 3) | (r >> 2); 
             *ai_ptr++ = (g << 2) | (g >> 4); 
             *ai_ptr++ = (b << 3) | (b >> 2); 
-            
-            *spi_ptr_16++ = pixel;
         }
     }
     return 0;
@@ -188,23 +219,43 @@ static int process_camera_frame(const uint8_t *rgb565_buf, uint32_t src_w, uint3
 #pragma GCC pop_options
 
 void camera_thread_entry(void *p1, void *p2, void *p3) {
+    ARG_UNUSED(p1);
+    ARG_UNUSED(p2);
+    ARG_UNUSED(p3);
     int current_buf_idx = 0; 
 
     while (1) {
         struct video_buffer *vbuf;
         if (video_dequeue(video_dev, &vbuf, K_MSEC(2000)) < 0) continue;
 
+        if (k_sem_take(&buf_free_sem[current_buf_idx], K_NO_WAIT) != 0) {
+            video_enqueue(video_dev, vbuf);
+            current_buf_idx = (current_buf_idx + 1) % PROC_BUF_COUNT;
+            continue;
+        }
+
+        // 🔧 關鍵修正：DCMI DMA 直接寫入 SDRAM，CPU 讀取前必須先 Invalidate D-Cache，避免讀到舊快取
+        SCB_InvalidateDCache_by_Addr((uint32_t *)vbuf->buffer, cam_fmt.size);
+
         uint32_t t_start = k_uptime_get_32();
-        
-        if (process_camera_frame(vbuf->buffer, cam_fmt.width, cam_fmt.height, current_buf_idx) == 0) {
+        bool queued = false;
+
+        if (process_camera_frame((const uint8_t *)vbuf->buffer, cam_fmt.width, cam_fmt.height, current_buf_idx) == 0) {
             uint32_t t_prep = k_uptime_get_32() - t_start;
             struct frame_msg msg = { .buf_idx = current_buf_idx, .prep_time = t_prep };
-            
-            while (k_msgq_put(&frame_msgq, &msg, K_NO_WAIT) != 0) {
-                k_msgq_purge(&frame_msgq);
+
+            if (k_msgq_put(&frame_msgq, &msg, K_NO_WAIT) == 0) {
+                queued = true;
+            } else {
+                LOG_WRN("frame_msgq full, dropping frame idx=%d", current_buf_idx);
             }
-            current_buf_idx = (current_buf_idx + 1) % 2;
         }
+
+        if (!queued) {
+            k_sem_give(&buf_free_sem[current_buf_idx]);
+        }
+
+        current_buf_idx = (current_buf_idx + 1) % PROC_BUF_COUNT;
         video_enqueue(video_dev, vbuf);
     }
 }
@@ -212,30 +263,38 @@ void camera_thread_entry(void *p1, void *p2, void *p3) {
 int main(void) {
     Enable_SDRAM_Cache();
     k_msleep(1000);
-    LOG_INF("Starting STEdgeAI + Zephyr Multi-Thread (SPI Output Mode)...");
+    LOG_INF("Starting STEdgeAI + Zephyr Multi-Thread (UART Streaming Mode)...");
 
-    if (!device_is_ready(spi_dev)) {
-        LOG_ERR("SPI not ready!");
+    if (!device_is_ready(uart_dev)) {
+        LOG_ERR("UART not ready!");
         return 0;
     }
 
-    // 🚨 修正：手動初始化 CS 腳位 (假設是 PK1)，並預設拉高 (Inactive)
-    if (gpio_is_ready_dt(&manual_cs)) {
-        gpio_pin_configure_dt(&manual_cs, GPIO_OUTPUT_INACTIVE);
-        gpio_pin_set_dt(&manual_cs, 1); // 實體電壓 3.3V
-    } else {
-        LOG_ERR("CS GPIO not ready!");
+    struct uart_config ucfg = {
+        .baudrate = UART_BAUDRATE,
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+    };
+    if (uart_configure(uart_dev, &ucfg) != 0) {
+        LOG_ERR("UART configure failed!");
+        return 0;
     }
 
-    // 🚨 修正：取消 Zephyr 對 CS 的控制 (.cs = NULL)
-  
-    spi_cfg.frequency = 1500000U; // 確保與 L4 完全一致的 15MHz
-    spi_cfg.operation = SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_LINES_SINGLE | SPI_TRANSFER_MSB;
+    k_sem_init(&uart_tx_done_sem, 0, 1);
+    uart_irq_callback_user_data_set(uart_dev, uart_isr, NULL);
+    uart_irq_rx_disable(uart_dev);
+    uart_irq_tx_disable(uart_dev);
 
     if (ai_init() != 0) return 0;
     App_Config.output.pOutBuff = detections;
     App_Config.output.nb_detect = 0;
     app_postprocess_init(&App_Config);
+
+    for (int i = 0; i < PROC_BUF_COUNT; i++) {
+        k_sem_init(&buf_free_sem[i], 1, 1);
+    }
 
     video_dev = DEVICE_DT_GET_ANY(st_stm32_dcmi); 
     if (!video_dev) video_dev = DEVICE_DT_GET(DT_NODELABEL(ov5640)); 
@@ -249,7 +308,7 @@ int main(void) {
                     NULL, NULL, NULL,
                     5, 0, K_NO_WAIT);
 
-    LOG_INF("System Ready. Pipelined Inference & SPI TX Started.");
+    LOG_INF("System Ready. Pipelined Inference & UART Streaming Started.");
     uint32_t frame_count = 0;
 
     while (1) {
@@ -268,9 +327,8 @@ int main(void) {
         if (err == 0) {
             app_postprocess_run((void**)out_buffers, &App_Config.output, &App_Config.input_static_param);
 
-            struct spi_header hdr;
+            struct frame_header hdr;
             hdr.magic_word = 0xAABB;
-            hdr.image_size = 192 * 192 * 2; 
 
             struct bbox_data bboxes[10];
             uint16_t valid_boxes = 0;
@@ -302,67 +360,72 @@ int main(void) {
                 }
             }
 
-hdr.box_count = valid_boxes;
+            hdr.box_count = valid_boxes;
 
-            // ==========================================
-            // 🗜️ 新增：直接拿 AI 用的 RGB888 壓成 JPEG！
-            // ==========================================
+            // 🔧 關鍵修正：移除重複壓縮，並在若壓縮大小超過上限時自動降品質重壓，絕不截斷 JPEG
             uint32_t t_compress_start = k_uptime_get_32();
-            jpeg_current_size = 0; // 每次壓縮前重置大小
-            
-            // 👉 神來一筆：直接餵入你的 my_camera_data[buf_idx]
-            stbi_write_jpg_to_func(my_jpeg_write_func, NULL, 192, 192, 3, my_camera_data[buf_idx], 80);
-            
-            uint32_t t_compress = k_uptime_get_32() - t_compress_start;
-            LOG_INF("🗜️ 壓縮完成！-> %u Bytes (耗時: %u ms)", jpeg_current_size, t_compress);
+            jpeg_current_size = 0;
+            jpeg_overflow = false;
+            stbi_write_jpg_to_func(my_jpeg_write_func, NULL, 192, 192, 3, my_camera_data[buf_idx], 70);
 
-            // 🚨 將標頭的 size 改成壓縮後的大小，L4 就會自動配合！
+            if (jpeg_overflow || jpeg_current_size > MAX_JPEG_SIZE) {
+                LOG_WRN("JPEG size (%u) exceeds limit (%u), re-encoding at quality 50...",
+                        (unsigned)jpeg_current_size, (unsigned)MAX_JPEG_SIZE);
+                jpeg_current_size = 0;
+                jpeg_overflow = false;
+                stbi_write_jpg_to_func(my_jpeg_write_func, NULL, 192, 192, 3, my_camera_data[buf_idx], 50);
+            }
+
+            // 壓縮徹底完成後，才釋放緩衝區給 camera_thread
+            k_sem_give(&buf_free_sem[buf_idx]);
+
+            uint32_t t_compress = k_uptime_get_32() - t_compress_start;
+
+            if (jpeg_overflow || jpeg_current_size < 4 || jpeg_current_size > MAX_JPEG_SIZE) {
+                LOG_ERR("JPEG size invalid (%u), dropping frame %u", (unsigned)jpeg_current_size, frame_count);
+                continue;
+            }
+
+            LOG_INF(
+                "H7 JPEG size=%u | HEAD=%02X %02X %02X %02X | "
+                "TAIL=%02X %02X %02X %02X",
+                (unsigned)jpeg_current_size,
+                compressed_jpeg_buffer[0],
+                compressed_jpeg_buffer[1],
+                compressed_jpeg_buffer[2],
+                compressed_jpeg_buffer[3],
+                compressed_jpeg_buffer[jpeg_current_size - 4],
+                compressed_jpeg_buffer[jpeg_current_size - 3],
+                compressed_jpeg_buffer[jpeg_current_size - 2],
+                compressed_jpeg_buffer[jpeg_current_size - 1]
+            );
+
             hdr.image_size = jpeg_current_size;
 
             // ==========================================
-            // 📡 執行極速 SPI 分批傳輸
+            // 📡 打包並透過 UART 送出
             // ==========================================
-            uint32_t t_spi_start = k_uptime_get_32();
+            uint32_t t_uart_start = k_uptime_get_32();
 
-            // 1. 手動拉低 CS 腳位
-            gpio_pin_set_dt(&manual_cs, 0); 
-            k_msleep(5); // 給 L4 充足的時間醒來準備
+            size_t boxes_bytes = (size_t)valid_boxes * sizeof(struct bbox_data);
+            size_t payload_offset = sizeof(hdr) + boxes_bytes;
+            size_t total_len = payload_offset + hdr.image_size;
 
-            // --- 階段 A：傳送固定 138 Bytes 的標頭區塊 ---
-            #define HEADER_BLOCK_SIZE (sizeof(struct spi_header) + 10 * sizeof(struct bbox_data))
-            uint8_t header_block[HEADER_BLOCK_SIZE] = {0}; 
-            
-            memcpy(header_block, &hdr, sizeof(hdr));
+            memcpy(uart_tx_buffer, &hdr, sizeof(hdr));
             if (valid_boxes > 0) {
-                memcpy(header_block + sizeof(hdr), bboxes, valid_boxes * sizeof(struct bbox_data));
+                memcpy(uart_tx_buffer + sizeof(hdr), bboxes, boxes_bytes);
             }
+            memcpy(uart_tx_buffer + payload_offset, compressed_jpeg_buffer, hdr.image_size);
 
-            struct spi_buf tx_hdr_buf = { .buf = header_block, .len = HEADER_BLOCK_SIZE };
-            struct spi_buf_set tx_hdr_set = { .buffers = &tx_hdr_buf, .count = 1 };
-            spi_write(spi_dev, &spi_cfg, &tx_hdr_set);
+            uart_send_blocking(uart_tx_buffer, total_len);
 
-            k_usleep(1000); // 稍微等待 L4 消化標頭
-
-            // --- 階段 B：直接傳送壓縮後的 JPEG 影像 ---
-            // 🚨 這裡改傳 compressed_jpeg_buffer
-            struct spi_buf tx_img_buf = { .buf = compressed_jpeg_buffer, .len = hdr.image_size };
-            struct spi_buf_set tx_img_set = { .buffers = &tx_img_buf, .count = 1 };
-            spi_write(spi_dev, &spi_cfg, &tx_img_set);
-
-            k_usleep(500);
-
-            // 傳輸結束，手動拉高 CS 腳位
-            gpio_pin_set_dt(&manual_cs, 1); 
-
-            uint32_t t_spi = k_uptime_get_32() - t_spi_start;
-
-            LOG_INF("⏱️ Frame %d -> AI: %u ms | Compress: %u ms | SPI: %u ms | Boxes: %u", 
-                    frame_count, t_ai, t_compress, t_spi, valid_boxes);
-            
-            // 🚀 因為現在檔案超小，L4 的 Wi-Fi 不用 0.1 秒就傳完了
-            // 所以 H7 只要稍微休息 100ms 就可以立刻準備抓下一張畫面！
-            k_msleep(100);
-        } else {
+            uint32_t t_uart = k_uptime_get_32() - t_uart_start;
+            if (frame_count % 30 == 0) {
+                LOG_INF(" Frame %u -> AI: %u ms | Compress: %u ms | UART TX: %u ms | Bytes: %u | Boxes: %u", 
+                        frame_count, t_ai, t_compress, t_uart, (unsigned)total_len, valid_boxes);
+            }
+                } else {
+            k_sem_give(&buf_free_sem[buf_idx]);
             LOG_WRN("[Error] AI inference failed! Code: 0x%08X", (unsigned int)err);
         }
     }
